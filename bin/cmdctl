@@ -1,0 +1,489 @@
+#!/usr/bin/env bash
+# cmdctl — Command Code multi-account suite
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)"
+LIB_DIR="$SCRIPT_DIR/lib"
+
+source "$LIB_DIR/common.sh"
+source "$LIB_DIR/api.sh"
+source "$LIB_DIR/accounts.sh"
+source "$LIB_DIR/health.sh"
+source "$LIB_DIR/pick.sh"
+source "$LIB_DIR/authswap.sh"
+source "$LIB_DIR/launcher.sh"
+
+_init_dirs
+_migrate_from_cmdusage
+
+USAGE() {
+  cat <<'EOF'
+cmdctl — multi-account management for Command Code
+
+Usage:
+  cmdctl accounts ls              list all saved accounts
+  cmdctl accounts add [NAME]      save current logged-in account (from `cmd login`)
+  cmdctl accounts rm NAME         remove an account
+  cmdctl accounts rename A B      rename an account
+  cmdctl accounts show [NAME]     show account details
+
+  cmdctl use NAME                 switch to an account (atomic auth swap)
+  cmdctl next                     switch to the best available account
+  cmdctl prev                     switch back to the previous account
+
+  cmdctl usage [VIEW] [--json]    token usage across coding agents (ccusage)
+  cmdctl dashboard [--json]       one-screen account + agent overview
+  cmdctl status                   current account + health overview
+  cmdctl check                    force-probe all accounts now
+
+  cmdctl run [-- CMD_ARGS...]     launch cmd with auto-switch + quota watcher
+  cmdctl alias                    print shell alias for auto integration
+  cmdctl doctor                   environment sanity checks
+  cmdctl help                     show this message
+
+Environment:
+  CMDCTL_DIR       override config dir       (default: ~/.config/cmdctl)
+  AUTH_FILE        override auth.json path    (default: ~/.commandcode/auth.json)
+  REAL_CLI         override command-code path (auto-detected)
+  EXHAUSTED_TTL    seconds before retrying exhausted accounts (default: 3600)
+  PROBE_CACHE_TTL  seconds to cache usage probes  (default: 300)
+  POLL_INTERVAL    seconds between watcher polls  (default: 15)
+
+Config files:
+  ~/.config/cmdctl/accounts.json   account registry
+  ~/.config/cmdctl/state.json      health, exhaustion, cache
+EOF
+}
+
+cmd_accounts() {
+  local subcmd="${1:-ls}"
+  shift || true
+  case "$subcmd" in
+    ls|list)
+      if [[ ! -f "$ACCOUNTS_FILE" ]] || [[ "$(jq '.accounts | length' "$ACCOUNTS_FILE")" -eq 0 ]]; then
+        echo "No accounts configured. Add one with: cmdctl accounts add"
+        return
+      fi
+      local current_name
+      current_name=$(health_get_current)
+      printf '%-25s  %-16s  %-12s  %s\n' "NAME" "KEY" "ADDED" "CURRENT"
+      printf '%-25s  %-16s  %-12s  %s\n' "----" "---" "-----" "-------"
+      while IFS= read -r line; do
+        local name key added
+        name=$(echo "$line" | cut -f1)
+        key=$(echo "$line" | cut -f2)
+        added=$(echo "$line" | cut -f3)
+        local cur=""
+        [[ "$name" == "$current_name" ]] && cur="*"
+        printf '%-25s  %-16s  %-12s  %s\n' "$name" "$key" "$added" "$cur"
+      done < <(jq -r '.accounts[] | "\(.name)\t\(.apiKey[0:12])…\t\(.addedAt // "-")"' "$ACCOUNTS_FILE")
+      ;;
+    add)    accounts_add "$@" ;;
+    rm)     accounts_rm "$@" ;;
+    rename) accounts_rename "$@" ;;
+    show)   accounts_show "$@" ;;
+    *)      echo "cmdctl: unknown accounts subcommand: $subcmd" >&2; return 1 ;;
+  esac
+}
+
+cmd_use() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && { echo "cmdctl: usage: cmdctl use <name>" >&2; return 1; }
+  local key
+  key=$(accounts_get_key "$name") || {
+    echo "cmdctl: account '$name' not found." >&2; return 1
+  }
+  [[ -z "$key" ]] && {
+    echo "cmdctl: account '$name' has no apiKey." >&2; return 1
+  }
+  auth_swap "$name"
+  echo "[cmdctl] Switched to $name"
+}
+
+cmd_next() {
+  local current_key=""
+  local current_name
+  current_name=$(health_get_current)
+  [[ -n "$current_name" ]] && current_key=$(accounts_get_key "$current_name")
+  local next
+  next=$(pick_best "$current_key") || {
+    echo "cmdctl: no healthy accounts available." >&2; return 1
+  }
+  [[ -z "$next" ]] && {
+    echo "cmdctl: no other accounts available." >&2; return 1
+  }
+  auth_swap "$next"
+  echo "[cmdctl] Switched to $next"
+}
+
+cmd_prev() {
+  # Restore from backup if available
+  if [[ ! -f "$AUTH_BAK" ]]; then
+    echo "cmdctl: no previous account backed up." >&2; return 1
+  fi
+  local prev_key
+  prev_key=$(jq -r '.apiKey // empty' "$AUTH_BAK")
+  [[ -z "$prev_key" ]] && {
+    echo "cmdctl: backup auth has no apiKey." >&2; return 1
+  }
+  local prev_name
+  prev_name=$(jq -r --arg k "$prev_key" '.accounts[] | select(.apiKey == $k) | .name // empty' "$ACCOUNTS_FILE" | head -1)
+  [[ -z "$prev_name" ]] && {
+    echo "cmdctl: previous account not in registry." >&2; return 1
+  }
+  auth_swap "$prev_name"
+  echo "[cmdctl] Restored previous account: $prev_name"
+}
+
+cmd_usage() {
+  if ! has_ccusage; then
+    echo "cmdctl: no usage backend found." >&2
+    echo "  Install one of: bun, npm, or the ccusage binary." >&2
+    echo "  Then try: cmdctl usage daily" >&2
+    return 1
+  fi
+
+  local view="daily"
+  if [[ "${1:-}" == "--json" ]]; then
+    shift
+    ccusage_run daily --json
+    return
+  fi
+  if [[ -n "${1:-}" ]]; then
+    view="$1"
+    shift
+  fi
+  case "$view" in
+    daily|weekly|monthly|session) ;;
+    *) echo "cmdctl: unknown usage view '$view' (try daily, weekly, monthly, session)" >&2; return 1 ;;
+  esac
+
+  ccusage_run "$view" "$@"
+}
+
+cmd_dashboard() {
+  local json_mode=false
+  [[ "${1:-}" == "--json" ]] && json_mode=true
+
+  if ! has_ccusage; then
+    echo "cmdctl: no usage backend found (needed for agent stats)." >&2
+    echo "  Install one of: bun, npm, or the ccusage binary." >&2
+  fi
+
+  local current_name
+  current_name=$(health_get_current)
+  local account_count
+  account_count=$(accounts_count)
+
+  if [[ "$json_mode" == "true" ]]; then
+    local probes_json
+    probes_json=$(probe_accounts cached | jq -R -s 'split("\n") | map(select(length > 0)) | map(split("\t")) | map({name: .[0], probe: (.[1] | fromjson? // {})})')
+    local agents_json
+    agents_json=$(has_ccusage && ccusage_run daily --json 2>/dev/null | jq '.' 2>/dev/null || echo 'null')
+
+    jq -n \
+      --arg current "${current_name:-null}" \
+      --argjson accountCount "$account_count" \
+      --argjson accounts "$probes_json" \
+      --argjson agents "$agents_json" \
+      '{current:$current, accountCount:$accountCount, accounts:$accounts, agentUsage:$agents}'
+    return
+  fi
+
+  local title="cmdctl dashboard"
+  echo "$title"
+  printf '%*s\n' "$(( ${#title} )) " "" | tr ' ' '─'
+  echo ""
+  echo "Accounts: $account_count   Current: ${current_name:-none}"
+  echo ""
+
+  printf '%-24s %-10s %-10s %-12s %-14s %s\n' "ACCOUNT" "STATUS" "PLAN" "TOKENS" "COST" "CREDITS"
+  printf '%-24s %-10s %-10s %-12s %-14s %s\n' "-------" "------" "----" "------" "-----" "-------"
+
+  local total_tokens=0 total_cost=0
+  while IFS=$'\t' read -r name probe; do
+    [[ -z "$name" ]] && continue
+    local err
+    err=$(echo "$probe" | jq -r '.error // empty' 2>/dev/null)
+    local mark=" "
+    [[ "$name" == "$current_name" ]] && mark="*"
+    if [[ -n "$err" ]]; then
+      printf '%-24s %-10s\n' "$mark$name" "$err"
+      continue
+    fi
+    local status plan tokens cost free purchased
+    status=$(echo "$probe" | jq -r '.status // "?"')
+    plan=$(echo "$probe" | jq -r '.plan // "?"')
+    tokens=$(echo "$probe" | jq -r '.tokens // 0')
+    cost=$(echo "$probe" | jq -r '.cost // 0')
+    free=$(echo "$probe" | jq -r '.freeCredits // 0')
+    purchased=$(echo "$probe" | jq -r '.purchasedCredits // 0')
+    total_tokens=$(awk "BEGIN{print $total_tokens + $tokens}")
+    total_cost=$(awk "BEGIN{print $total_cost + $cost}")
+    printf '%-24s %-10s %-10s %-12s %-14s %s\n' \
+      "$mark$name" "$status" "$plan" \
+      "$(human_tokens "$tokens")" \
+      "$(format_cost "$cost")" \
+      "$(human_tokens "$free") + $(human_tokens "$purchased")"
+  done < <(probe_accounts cached)
+
+  echo ""
+  echo "TOTAL ACROSS ACCOUNTS — $(human_tokens "$total_tokens") tokens, $(format_cost "$total_cost")"
+  echo ""
+
+  if has_ccusage; then
+    echo "AGENT USAGE (local, across Claude Code / Codex / etc.)"
+    echo ""
+    ccusage_run daily 2>/dev/null || echo "  (ccusage report unavailable)"
+  else
+    echo "AGENT USAGE — install ccusage (or bun/npm) to see Claude Code, Codex, and friends."
+  fi
+  echo ""
+  echo "Legend: * current account   Credits shown as free + purchased"
+}
+
+cmd_status() {
+  local current_name current_key
+  current_name=$(health_get_current)
+  echo "Current account: ${current_name:-none}"
+  echo ""
+
+  if [[ -z "$current_name" ]]; then
+    echo "Set one with: cmdctl use <name>"
+    return
+  fi
+
+  current_key=$(accounts_get_key "$current_name")
+  if [[ -z "$current_key" ]]; then
+    echo "Key not found in registry."
+    return
+  fi
+
+  # Probe current account
+  echo "Probing $current_name..."
+  local probe
+  probe=$(health_probe_cached "$current_key" "$current_name" 2>/dev/null) || true
+  local err
+  err=$(echo "$probe" | jq -r '.error // empty')
+  if [[ -n "$err" ]]; then
+    echo "  Error: $err"
+  else
+    local free purchased tokens cost plan status
+    free=$(echo "$probe" | jq -r '.freeCredits // 0')
+    purchased=$(echo "$probe" | jq -r '.purchasedCredits // 0')
+    tokens=$(echo "$probe" | jq -r '.tokens // 0')
+    cost=$(echo "$probe" | jq -r '.cost // 0')
+    plan=$(echo "$probe" | jq -r '.plan // "?"')
+    status=$(echo "$probe" | jq -r '.status // "?"')
+
+    echo "  User:    $(echo "$probe" | jq -r '.user')"
+    echo "  Plan:    $plan ($status)"
+    echo "  Credits: $(human_tokens "$free") free + $(human_tokens "$purchased") purchased"
+    echo "  Usage:   $(human_tokens "$tokens") tokens this period  $(format_cost "$cost")"
+    echo "  Cap:     $(usage_bar "$tokens" 800000000) $(human_tokens "$tokens") / 800.0M"
+  fi
+
+  # Health overview
+  echo ""
+  echo "Account health:"
+  while IFS= read -r name; do
+    local key status_icon="●"
+    key=$(accounts_get_key "$name") || continue
+    if [[ "$name" == "$current_name" ]]; then
+      status_icon="→"
+    elif health_is_exhausted "$key" 2>/dev/null; then
+      status_icon="✗"
+    fi
+    printf "  %s %s\n" "$status_icon" "$name"
+  done < <(accounts_names)
+  echo ""
+  echo "Legend: → current  ● healthy  ✗ exhausted"
+}
+
+cmd_check() {
+  echo "Probing all accounts..."
+  printf '%-25s  %-10s  %-12s  %-10s  %-12s  %s\n' "NAME" "STATUS" "PLAN" "TOKENS" "CREDITS" "COST"
+  printf '%-25s  %-10s  %-12s  %-10s  %-12s  %s\n' "----" "------" "----" "------" "-------" "----"
+  while IFS=$'\t' read -r name probe; do
+    local err
+    err=$(echo "$probe" | jq -r '.error // empty' 2>/dev/null)
+    if [[ -n "$err" ]]; then
+      printf '%-25s  %-10s\n' "$name" "$err"
+      local key
+      key=$(accounts_get_key "$name")
+      [[ "$err" == "QUOTA" || "$err" == "AUTH" ]] && health_mark_exhausted "$key"
+    else
+      local free purchased
+      free=$(echo "$probe" | jq -r '.freeCredits // 0')
+      purchased=$(echo "$probe" | jq -r '.purchasedCredits // 0')
+      printf '%-25s  %-10s  %-12s  %-10s  %-12s  %s\n' \
+        "$name" \
+        "$(echo "$probe" | jq -r '.status')" \
+        "$(echo "$probe" | jq -r '.plan')" \
+        "$(human_tokens "$(echo "$probe" | jq '.tokens')")" \
+        "$(human_tokens "$free")+$(human_tokens "$purchased")" \
+        "$(format_cost "$(echo "$probe" | jq -r '.cost // 0')")"
+    fi
+  done < <(probe_accounts fresh)
+}
+
+cmd_run() {
+  local args=()
+  # Separate -- from args
+  local past_dashes=false
+  for a in "$@"; do
+    if [[ "$a" == "--" ]]; then
+      past_dashes=true
+      continue
+    fi
+    if $past_dashes; then
+      args+=("$a")
+    fi
+  done
+  launcher_run "${args[@]}"
+}
+
+cmd_alias() {
+  local cmdctl_bin
+  cmdctl_bin=$(command -v cmdctl 2>/dev/null || echo "cmdctl")
+  echo "# Add to ~/.bashrc or ~/.zshrc:"
+  echo "alias cmd='cmdctl run --'"
+  echo ""
+  echo "# Or if cmdctl isn't on PATH yet, use the full path:"
+  echo "alias cmd='$cmdctl_bin run --'"
+}
+
+cmd_doctor() {
+  echo "cmdctl doctor"
+  echo ""
+
+  # Bash version
+  echo -n "  Bash:          ${BASH_VERSION:-not bash}"
+  [[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]] && echo " ✓" || echo " ✗ (need 4+)"
+
+  # Dependencies
+  for bin in curl jq node; do
+    printf "  %-14s" "$bin:"
+    if command -v "$bin" >/dev/null 2>&1; then
+      local ver
+      ver=$("$bin" --version 2>/dev/null | head -1)
+      echo " $ver ✓"
+    else
+      echo " NOT FOUND ✗"
+    fi
+  done
+
+  # command-code
+  printf "  %-14s" "command-code:"
+  if command -v cmd >/dev/null 2>&1 || command -v commandcode >/dev/null 2>&1; then
+    local real
+    real=$(find_real_cli 2>/dev/null) && echo " $real ✓" || echo " found (entrypoint unresolved)"
+  else
+    echo " NOT FOUND ✗ (npm i -g command-code)"
+  fi
+
+  # Auth file
+  printf "  %-14s" "auth.json:"
+  if [[ -f "$AUTH_FILE" ]]; then
+    local key user
+    key=$(jq -r '.apiKey // empty' "$AUTH_FILE")
+    user=$(jq -r '.userName // "?"' "$AUTH_FILE")
+    [[ -n "$key" ]] && echo " $user ✓" || echo " exists but no apiKey ✗"
+  else
+    echo " not found (run cmd login)"
+  fi
+
+  # Config
+  printf "  %-14s" "accounts.json:"
+  if [[ -f "$ACCOUNTS_FILE" ]]; then
+    local count
+    count=$(jq '.accounts | length' "$ACCOUNTS_FILE")
+    echo " $count account(s) ✓"
+  else
+    echo " not found (will be created on first add)"
+  fi
+
+  # cmdusage
+  printf "  %-14s" "ccusage:"
+  if has_ccusage; then
+    echo " found ✓ (multi-agent usage)"
+  else
+    echo " optional — install bun/npm for agent stats"
+  fi
+
+  echo ""
+
+  # Check if alias is installed
+  if [[ -f "$HOME/.bashrc" ]] && grep -q 'cmdctl run' "$HOME/.bashrc" 2>/dev/null; then
+    echo "  Shell alias: installed ✓"
+  else
+    echo "  Shell alias: not installed — run: cmdctl alias >> ~/.bashrc"
+  fi
+
+  # Check if stop hook is installed
+  local settings="$HOME/.commandcode/settings.json"
+  if [[ -f "$settings" ]] && grep -q 'on-stop' "$settings" 2>/dev/null; then
+    echo "  Stop hook:   installed ✓"
+  else
+    echo "  Stop hook:   not installed — run: cmdctl install-hook"
+  fi
+}
+
+cmd_install_hook() {
+  local settings_dir="$HOME/.commandcode"
+  local settings="$settings_dir/settings.json"
+  local hook_path
+  hook_path="$(cd "$(dirname "$(readlink -f "$0")")/.." && pwd)/hooks/on-stop.sh"
+  chmod +x "$hook_path"
+
+  mkdir -p "$settings_dir"
+  if [[ ! -f "$settings" ]]; then
+    json_write "$settings" "$(jq -n --arg cmd "$hook_path" '{
+      hooks: { Stop: [{ hooks: [{ type: "command", command: $cmd, timeout: 30 }] }] }
+    }')"
+    echo "[cmdctl] Installed Stop hook into $settings"
+    return
+  fi
+
+  if grep -q 'on-stop' "$settings" 2>/dev/null; then
+    echo "[cmdctl] Stop hook already installed."
+    return
+  fi
+
+  # Merge into existing settings
+  local tmp
+  tmp=$(jq --arg cmd "$hook_path" '
+    .hooks = (.hooks // {}) |
+    .hooks.Stop = ((.hooks.Stop // []) + [{
+      hooks: [{ type: "command", command: $cmd, timeout: 30 }]
+    }])
+  ' "$settings")
+  json_write "$settings" "$tmp"
+  echo "[cmdctl] Installed Stop hook into $settings"
+}
+
+# --- dispatch ---
+
+cmd="${1:-help}"
+shift || true
+
+case "$cmd" in
+  accounts)  cmd_accounts "$@" ;;
+  use)       cmd_use "$@" ;;
+  next)      cmd_next ;;
+  prev)      cmd_prev ;;
+  usage)     cmd_usage "$@" ;;
+  dashboard) cmd_dashboard "$@" ;;
+  status)    cmd_status ;;
+  check)     cmd_check ;;
+  run)       cmd_run "$@" ;;
+  alias)     cmd_alias ;;
+  doctor)    cmd_doctor ;;
+  install-hook) cmd_install_hook ;;
+  help|-h|--help) USAGE ;;
+  *)
+    echo "cmdctl: unknown command '$cmd'" >&2
+    echo "Run 'cmdctl help' for usage." >&2
+    exit 1
+    ;;
+esac

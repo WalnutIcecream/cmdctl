@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+*.tgz
+
+# Config / state (user-specific, contains API keys)
+state.json
+accounts.json
+
+# Command Code artifacts
+*.cmdctl-bak
+.watcher-kill
+
+# Editor
+.DS_Store
+*.swp
+
+# Test fixtures
+tests/fixtures/
