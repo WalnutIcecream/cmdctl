@@ -4,8 +4,23 @@
 CMDCTL_DIR="${CMDCTL_DIR:-$HOME/.config/cmdctl}"
 ACCOUNTS_FILE="$CMDCTL_DIR/accounts.json"
 STATE_FILE="$CMDCTL_DIR/state.json"
+ENV_FILE="${CMDCTL_ENV_FILE:-$CMDCTL_DIR/accounts.env}"
 AUTH_FILE="${AUTH_FILE:-$HOME/.commandcode/auth.json}"
 AUTH_BAK="${AUTH_FILE}.cmdctl-bak"
+
+# Coding harnesses and report views understood by ccusage.
+CCUSAGE_SOURCES="claude codex opencode amp droid codebuff hermes pi goose openclaw kilo kimi qwen copilot gemini antigravity grok zcode"
+CCUSAGE_VIEWS="daily weekly monthly session"
+
+# Harnesses cmdctl reads natively from local session logs (ccusage has no source
+# for these). Command Code is the one that ships with this tool.
+NATIVE_SOURCES="commandcode command-code command_code cmd cc"
+NATIVE_SOURCE_LABEL="commandcode"
+
+# Defaults for `cmdctl usage` when no harness/view is given on the command line.
+# "account" is the headline view: per-account totals from the Command Code API.
+CMDCTL_DEFAULT_SOURCE="${CMDCTL_DEFAULT_SOURCE:-}"
+CMDCTL_DEFAULT_VIEW="${CMDCTL_DEFAULT_VIEW:-account}"
 
 API_BASE="https://api.commandcode.ai"
 API_TIMEOUT=${API_TIMEOUT:-20}
@@ -27,6 +42,42 @@ _migrate_from_cmdusage() {
     json_write "$ACCOUNTS_FILE" "$(jq '.' "$old")"
     echo "[cmdctl] Migrated accounts from cmdusage" >&2
   fi
+}
+
+# Auto-load accounts from the env file when the registry is still empty.
+_import_env_if_empty() {
+  [[ -f "$ENV_FILE" ]] || return 0
+  local count
+  count=$(jq '.accounts | length' "$ACCOUNTS_FILE" 2>/dev/null || echo 0)
+  [[ "${count:-0}" -gt 0 ]] && return 0
+  accounts_import_env "$ENV_FILE" true >&2
+}
+
+# True when the argument names a ccusage harness (claude, codex, ...).
+is_ccusage_source() {
+  local candidate="$1" source
+  for source in $CCUSAGE_SOURCES; do
+    [[ "$candidate" == "$source" ]] && return 0
+  done
+  return 1
+}
+
+# True when the argument names a harness cmdctl reads natively (commandcode, ...).
+is_native_source() {
+  local candidate="$1" source
+  for source in $NATIVE_SOURCES; do
+    [[ "$candidate" == "$source" ]] && return 0
+  done
+  return 1
+}
+
+# True when the argument names a ccusage report view (daily, weekly, ...).
+is_ccusage_view() {
+  local candidate="$1" view
+  for view in $CCUSAGE_VIEWS; do
+    [[ "$candidate" == "$view" ]] && return 0
+  done
+  return 1
 }
 
 # Atomic JSON write

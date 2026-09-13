@@ -12,9 +12,11 @@ source "$LIB_DIR/health.sh"
 source "$LIB_DIR/pick.sh"
 source "$LIB_DIR/authswap.sh"
 source "$LIB_DIR/launcher.sh"
+source "$LIB_DIR/usage.sh"
 
 _init_dirs
 _migrate_from_cmdusage
+_import_env_if_empty
 
 USAGE() {
   cat <<'EOF'
@@ -26,13 +28,19 @@ Usage:
   cmdctl accounts rm NAME         remove an account
   cmdctl accounts rename A B      rename an account
   cmdctl accounts show [NAME]     show account details
+  cmdctl accounts env             create/show the accounts env file
+  cmdctl accounts import [FILE]   load accounts from env file (NAME=API_KEY)
 
   cmdctl use NAME                 switch to an account (atomic auth swap)
   cmdctl next                     switch to the best available account
   cmdctl prev                     switch back to the previous account
 
-  cmdctl usage [VIEW] [--json]    token usage across coding agents (ccusage)
-  cmdctl dashboard [--json]       one-screen account + agent overview
+  cmdctl usage [HARNESS|all] [VIEW]
+                                  token usage; Command Code is native, the rest
+                                  go through ccusage. VIEW: account (default),
+                                  daily, weekly, monthly, session.
+                                  Flags: --list, --source NAME, --limit N, --json
+  cmdctl dashboard [--source H]   one-screen account + agent overview
   cmdctl status                   current account + health overview
   cmdctl check                    force-probe all accounts now
 
@@ -43,6 +51,10 @@ Usage:
 
 Environment:
   CMDCTL_DIR       override config dir       (default: ~/.config/cmdctl)
+  CMDCTL_ENV_FILE  override accounts env file (default: $CMDCTL_DIR/accounts.env)
+  CMDCTL_DEFAULT_SOURCE  default usage harness (default: all)
+  CMDCTL_DEFAULT_VIEW    default usage view    (default: daily)
+  COMMANDCODE_DIR  Command Code data dir      (default: ~/.commandcode)
   AUTH_FILE        override auth.json path    (default: ~/.commandcode/auth.json)
   REAL_CLI         override command-code path (auto-detected)
   EXHAUSTED_TTL    seconds before retrying exhausted accounts (default: 3600)
@@ -51,6 +63,7 @@ Environment:
 
 Config files:
   ~/.config/cmdctl/accounts.json   account registry
+  ~/.config/cmdctl/accounts.env    optional NAME=API_KEY bootstrap file
   ~/.config/cmdctl/state.json      health, exhaustion, cache
 EOF
 }
@@ -61,7 +74,9 @@ cmd_accounts() {
   case "$subcmd" in
     ls|list)
       if [[ ! -f "$ACCOUNTS_FILE" ]] || [[ "$(jq '.accounts | length' "$ACCOUNTS_FILE")" -eq 0 ]]; then
-        echo "No accounts configured. Add one with: cmdctl accounts add"
+        echo "No accounts configured."
+        echo "  Add from a logged-in session: cmdctl accounts add"
+        echo "  Or bootstrap from env file:   cmdctl accounts env && cmdctl accounts import"
         return
       fi
       local current_name
@@ -82,6 +97,20 @@ cmd_accounts() {
     rm)     accounts_rm "$@" ;;
     rename) accounts_rename "$@" ;;
     show)   accounts_show "$@" ;;
+    env)
+      if [[ -f "$ENV_FILE" ]]; then
+        accounts_env_show
+      else
+        accounts_env_init
+      fi
+      ;;
+    import)
+      if [[ "${1:-}" == "" ]]; then
+        accounts_import_env
+      else
+        accounts_import_env "$1"
+      fi
+      ;;
     *)      echo "cmdctl: unknown accounts subcommand: $subcmd" >&2; return 1 ;;
   esac
 }
@@ -135,35 +164,161 @@ cmd_prev() {
   echo "[cmdctl] Restored previous account: $prev_name"
 }
 
+cmd_usage_list() {
+  echo "Native harnesses (read locally, no ccusage needed):"
+  echo "  commandcode    aliases: cmd, cc, command-code   ($COMMANDCODE_DIR/projects)"
+  echo ""
+  echo "ccusage harnesses:"
+  local s col=0
+  for s in $CCUSAGE_SOURCES; do
+    printf '  %-12s' "$s"
+    col=$((col + 1))
+    if (( col % 3 == 0 )); then echo; fi
+  done
+  echo ""
+  echo ""
+  echo "Views: account (default), daily, weekly, monthly, session"
+  echo "  account  per-account totals from the Command Code API (current period)"
+  echo "  others   local session logs, grouped by date/week/month/session"
+  echo ""
+  echo "Usage: cmdctl usage [HARNESS|all] [VIEW] [--json] [--limit N]"
+  echo "  cmdctl usage                  # account view + sessions, then ccusage"
+  echo "  cmdctl usage commandcode      # Command Code: accounts + sessions"
+  echo "  cmdctl usage commandcode daily"
+  echo "  cmdctl usage claude monthly   # a single ccusage harness"
+}
+
+# Render the native (Command Code) report for a view. "account" additionally
+# prints the session breakdown, since local logs can't be tied to an account.
+cmd_usage_native_report() {
+  local view="$1" json_mode="$2" limit="$3"
+
+  if [[ "$view" == "account" ]]; then
+    if [[ "$json_mode" == "true" ]]; then
+      jq -n \
+        --argjson accounts "$(code_usage_accounts_json cached)" \
+        --argjson sessions "$(code_usage_json session)" \
+        '{accounts: $accounts, sessions: $sessions}'
+    else
+      echo "Command Code — By account (current billing period)"
+      echo ""
+      code_usage_accounts cached
+      echo ""
+      code_usage_report session "$limit"
+    fi
+    return 0
+  fi
+
+  if [[ "$json_mode" == "true" ]]; then
+    code_usage_json "$view"
+  else
+    code_usage_report "$view" "$limit"
+  fi
+}
+
 cmd_usage() {
+  local source="" view="" json_mode=false limit=30 list_only=false passthrough=()
+  while (( $# > 0 )); do
+    case "$1" in
+      --list|-l)
+        list_only=true; shift ;;
+      --json)
+        json_mode=true; shift ;;
+      --limit)
+        limit="${2:-30}"; shift 2 ;;
+      -s|--source)
+        if [[ -z "${2:-}" ]]; then
+          echo "cmdctl: --source needs a harness name (e.g. --source claude)" >&2
+          return 1
+        fi
+        source="$2"; shift 2 ;;
+      all)
+        source="all"; shift ;;
+      -*)
+        passthrough+=("$1"); shift ;;
+      *)
+        if [[ -z "$source" ]] && { is_native_source "$1" || is_ccusage_source "$1"; }; then
+          source="$1"
+        elif [[ -z "$view" ]] && { is_ccusage_view "$1" || [[ "$1" == "account" ]]; }; then
+          view="$1"
+        else
+          passthrough+=("$1")
+        fi
+        shift ;;
+    esac
+  done
+
+  if [[ "$list_only" == "true" ]]; then
+    cmd_usage_list
+    return
+  fi
+
+  [[ -z "$view" ]] && view="${CMDCTL_DEFAULT_VIEW:-account}"
+  [[ -z "$source" ]] && source="${CMDCTL_DEFAULT_SOURCE:-}"
+
+  # Native harness (Command Code): read API + local session logs, no ccusage.
+  if is_native_source "$source"; then
+    cmd_usage_native_report "$view" "$json_mode" "$limit"
+    return
+  fi
+
   if ! has_ccusage; then
-    echo "cmdctl: no usage backend found." >&2
-    echo "  Install one of: bun, npm, or the ccusage binary." >&2
-    echo "  Then try: cmdctl usage daily" >&2
+    echo "cmdctl: no ccusage backend found for harness '${source:-all}'." >&2
+    echo "  Command Code usage still works: cmdctl usage commandcode $view" >&2
+    echo "  Otherwise install ccusage (or have npm/bun available)." >&2
     return 1
   fi
 
-  local view="daily"
-  if [[ "${1:-}" == "--json" ]]; then
-    shift
-    ccusage_run daily --json
+  # A single, explicit ccusage harness. "account" is Command-Code-only, so fall
+  # back to the daily report rather than passing an unknown view through.
+  if [[ -n "$source" && "$source" != "all" ]]; then
+    local cc_view="$view"
+    [[ "$cc_view" == "account" ]] && cc_view="daily"
+    local args=("$source" "$cc_view")
+    (( ${#passthrough[@]} > 0 )) && args+=("${passthrough[@]}")
+    ccusage_run "${args[@]}"
     return
   fi
-  if [[ -n "${1:-}" ]]; then
-    view="$1"
-    shift
-  fi
-  case "$view" in
-    daily|weekly|monthly|session) ;;
-    *) echo "cmdctl: unknown usage view '$view' (try daily, weekly, monthly, session)" >&2; return 1 ;;
-  esac
 
-  ccusage_run "$view" "$@"
+  # Everything: Command Code natively, then ccusage's aggregate.
+  local other_view="$view"
+  [[ "$other_view" == "account" ]] && other_view="daily"
+
+  if [[ "$json_mode" == "true" ]]; then
+    local cc_json other_json
+    if [[ "$view" == "account" ]]; then
+      cc_json=$(jq -cn \
+        --argjson accounts "$(code_usage_accounts_json cached)" \
+        --argjson sessions "$(code_usage_json session)" \
+        '{accounts: $accounts, sessions: $sessions}')
+    else
+      cc_json=$(code_usage_json "$view")
+    fi
+    other_json=$(ccusage_run "$other_view" --json 2>/dev/null || echo 'null')
+    jq -n --argjson cc "$cc_json" --argjson other "$other_json" \
+      '{commandcode: $cc, ccusage: $other}'
+    return
+  fi
+
+  cmd_usage_native_report "$view" false "$limit"
+  echo ""
+  echo "───────────────────────────────────────────────────────────────"
+  echo "Other harnesses (via ccusage) — $other_view"
+  echo ""
+  local cc_args=("$other_view")
+  (( ${#passthrough[@]} > 0 )) && cc_args+=("${passthrough[@]}")
+  ccusage_run "${cc_args[@]}"
 }
 
 cmd_dashboard() {
-  local json_mode=false
-  [[ "${1:-}" == "--json" ]] && json_mode=true
+  local json_mode=false source=""
+  while (( $# > 0 )); do
+    case "$1" in
+      --json)     json_mode=true; shift ;;
+      -s|--source) source="${2:-}"; shift 2 ;;
+      *)          shift ;;
+    esac
+  done
 
   if ! has_ccusage; then
     echo "cmdctl: no usage backend found (needed for agent stats)." >&2
@@ -175,11 +330,14 @@ cmd_dashboard() {
   local account_count
   account_count=$(accounts_count)
 
+  local agent_args=(daily)
+  [[ -n "$source" ]] && agent_args=("$source" daily)
+
   if [[ "$json_mode" == "true" ]]; then
     local probes_json
     probes_json=$(probe_accounts cached | jq -R -s 'split("\n") | map(select(length > 0)) | map(split("\t")) | map({name: .[0], probe: (.[1] | fromjson? // {})})')
     local agents_json
-    agents_json=$(has_ccusage && ccusage_run daily --json 2>/dev/null | jq '.' 2>/dev/null || echo 'null')
+    agents_json=$(has_ccusage && ccusage_run "${agent_args[@]}" --json 2>/dev/null | jq '.' 2>/dev/null || echo 'null')
 
     jq -n \
       --arg current "${current_name:-null}" \
@@ -192,13 +350,17 @@ cmd_dashboard() {
 
   local title="cmdctl dashboard"
   echo "$title"
-  printf '%*s\n' "$(( ${#title} )) " "" | tr ' ' '─'
+  local underline="" i
+  for (( i = 0; i < ${#title}; i++ )); do
+    underline+="─"
+  done
+  echo "$underline"
   echo ""
   echo "Accounts: $account_count   Current: ${current_name:-none}"
   echo ""
 
-  printf '%-24s %-10s %-10s %-12s %-14s %s\n' "ACCOUNT" "STATUS" "PLAN" "TOKENS" "COST" "CREDITS"
-  printf '%-24s %-10s %-10s %-12s %-14s %s\n' "-------" "------" "----" "------" "-----" "-------"
+  printf '%-24s %-10s %-16s %-12s %-14s %s\n' "ACCOUNT" "STATUS" "PLAN" "TOKENS" "COST" "CREDITS"
+  printf '%-24s %-10s %-16s %-12s %-14s %s\n' "-------" "------" "----" "------" "-----" "-------"
 
   local total_tokens=0 total_cost=0
   while IFS=$'\t' read -r name probe; do
@@ -220,7 +382,7 @@ cmd_dashboard() {
     purchased=$(echo "$probe" | jq -r '.purchasedCredits // 0')
     total_tokens=$(awk "BEGIN{print $total_tokens + $tokens}")
     total_cost=$(awk "BEGIN{print $total_cost + $cost}")
-    printf '%-24s %-10s %-10s %-12s %-14s %s\n' \
+    printf '%-24s %-10s %-16s %-12s %-14s %s\n' \
       "$mark$name" "$status" "$plan" \
       "$(human_tokens "$tokens")" \
       "$(format_cost "$cost")" \
@@ -231,10 +393,19 @@ cmd_dashboard() {
   echo "TOTAL ACROSS ACCOUNTS — $(human_tokens "$total_tokens") tokens, $(format_cost "$total_cost")"
   echo ""
 
+  echo "COMMAND CODE — local session usage"
+  echo ""
+  code_usage_summary
+  echo ""
+
   if has_ccusage; then
-    echo "AGENT USAGE (local, across Claude Code / Codex / etc.)"
+    if [[ -n "$source" ]]; then
+      echo "AGENT USAGE — $source (local)"
+    else
+      echo "AGENT USAGE — all other harnesses (local)"
+    fi
     echo ""
-    ccusage_run daily 2>/dev/null || echo "  (ccusage report unavailable)"
+    ccusage_run "${agent_args[@]}" 2>/dev/null || echo "  (ccusage report unavailable)"
   else
     echo "AGENT USAGE — install ccusage (or bun/npm) to see Claude Code, Codex, and friends."
   fi
@@ -302,29 +473,7 @@ cmd_status() {
 
 cmd_check() {
   echo "Probing all accounts..."
-  printf '%-25s  %-10s  %-12s  %-10s  %-12s  %s\n' "NAME" "STATUS" "PLAN" "TOKENS" "CREDITS" "COST"
-  printf '%-25s  %-10s  %-12s  %-10s  %-12s  %s\n' "----" "------" "----" "------" "-------" "----"
-  while IFS=$'\t' read -r name probe; do
-    local err
-    err=$(echo "$probe" | jq -r '.error // empty' 2>/dev/null)
-    if [[ -n "$err" ]]; then
-      printf '%-25s  %-10s\n' "$name" "$err"
-      local key
-      key=$(accounts_get_key "$name")
-      [[ "$err" == "QUOTA" || "$err" == "AUTH" ]] && health_mark_exhausted "$key"
-    else
-      local free purchased
-      free=$(echo "$probe" | jq -r '.freeCredits // 0')
-      purchased=$(echo "$probe" | jq -r '.purchasedCredits // 0')
-      printf '%-25s  %-10s  %-12s  %-10s  %-12s  %s\n' \
-        "$name" \
-        "$(echo "$probe" | jq -r '.status')" \
-        "$(echo "$probe" | jq -r '.plan')" \
-        "$(human_tokens "$(echo "$probe" | jq '.tokens')")" \
-        "$(human_tokens "$free")+$(human_tokens "$purchased")" \
-        "$(format_cost "$(echo "$probe" | jq -r '.cost // 0')")"
-    fi
-  done < <(probe_accounts fresh)
+  code_usage_accounts fresh
 }
 
 cmd_run() {
@@ -403,7 +552,17 @@ cmd_doctor() {
     echo " not found (will be created on first add)"
   fi
 
-  # cmdusage
+  # Command Code local session logs (native usage source)
+  printf "  %-14s" "cc sessions:"
+  if [[ -d "$COMMANDCODE_DIR/projects" ]]; then
+    local sessions
+    sessions=$(find "$COMMANDCODE_DIR/projects" -type f -name '*.jsonl' ! -name '*.checkpoints.jsonl' 2>/dev/null | wc -l | tr -d ' ')
+    echo " $sessions file(s) in $COMMANDCODE_DIR/projects ✓"
+  else
+    echo " not found ($COMMANDCODE_DIR/projects)"
+  fi
+
+  # ccusage (local multi-agent usage backend)
   printf "  %-14s" "ccusage:"
   if has_ccusage; then
     echo " found ✓ (multi-agent usage)"

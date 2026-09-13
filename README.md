@@ -88,11 +88,13 @@ From here on, just type `cmd` like always. cmdctl silently picks the healthiest 
 | `cmdctl accounts rm NAME` | Yeet an account from the registry |
 | `cmdctl accounts rename OLD NEW` | Give an account a better name |
 | `cmdctl accounts show [NAME]` | Inspect one account's details |
+| `cmdctl accounts env` | Create (or show) the `accounts.env` bootstrap file |
+| `cmdctl accounts import [FILE]` | Load `NAME=API_KEY` lines from an env file |
 | `cmdctl use NAME` | Manually switch accounts |
 | `cmdctl next` | Jump to the best available account |
 | `cmdctl prev` | Undo that jump and restore the previous one |
-| `cmdctl usage [daily\|weekly\|monthly\|session]` | Token usage across all your coding agents |
-| `cmdctl dashboard` | One-screen account + agent overview (the fun one) |
+| `cmdctl usage [HARNESS\|all] [VIEW]` | Token usage — Command Code native, others via ccusage |
+| `cmdctl dashboard [--source HARNESS]` | One-screen account + agent overview (the fun one) |
 | `cmdctl status` | Current account health, with a usage bar |
 | `cmdctl check` | Force-probe every account right now |
 | `cmdctl run -- [args]` | Auto-switch launch (what the alias calls) |
@@ -104,13 +106,91 @@ Most commands accept `--json` where it makes sense (`usage`, `dashboard`), so yo
 
 ---
 
+## Picking which harness you're staring at
+
+`cmdctl usage` answers one question: *where did all my tokens go?* It gathers usage in two ways:
+
+- **Command Code** is built in. cmdctl reads its local session logs directly (`~/.commandcode/projects/**/*.jsonl`), so you get real per-turn input/output/cache tokens and cost with no extra tooling.
+- **Everything else** goes through [ccusage](https://github.com/ryoppippi/ccusage): Claude Code, Codex, OpenCode, Amp, Droid, Codebuff, Hermes, pi-agent, Goose, OpenClaw, Kilo, Kimi, Qwen, Copilot CLI, Gemini CLI, Antigravity, Grok, ZCode.
+
+```bash
+cmdctl usage                       # Command Code first, then all ccusage harnesses
+cmdctl usage commandcode           # Command Code only (native, offline)
+cmdctl usage commandcode monthly   # ...by month
+cmdctl usage commandcode session   # ...per conversation
+cmdctl usage claude                # just Claude Code, daily
+cmdctl usage codex monthly         # Codex, monthly
+cmdctl usage gemini session        # Gemini CLI, by session
+cmdctl usage --source droid weekly # same thing, flag-flavoured
+cmdctl usage --list                # list every harness + view
+cmdctl usage commandcode --json    # machine-readable, because of course
+```
+
+First positional is a **harness** (if it's a known one), second is a **view** (`daily`, `weekly`, `monthly`, `session`), and anything else is passed straight through. `commandcode` has aliases: `cmd`, `cc`, `command-code`. The dashboard takes the same `--source` flag:
+
+```bash
+cmdctl dashboard --source claude
+```
+
+A native Command Code report looks like this:
+
+```
+Command Code — Daily usage
+
+  DAILY        TURNS   INPUT      OUTPUT     CACHE      COST         MODELS
+  2026-09-09   406     165.1M     312.2k     163.8M     $3.45        deepseek-v4-flash, v4-pro
+  2026-09-10   67      8.0M       54.7k      7.8M       $0.14        deepseek-v4-flash
+
+  TOTAL: 913 turns · 228.5M in · 599.0k out · 226.2M cached · $33.49
+```
+
+Under the hood it sums each turn's `usage` block and groups by day, ISO week, month, or session. It is 100% local and read-only.
+
+---
+
+## Accounts from an env file
+
+Typing keys by hand is for people with spare time. Drop them in a dotenv-style file instead:
+
+```bash
+cmdctl accounts env       # writes ~/.config/cmdctl/accounts.env (chmod 600)
+```
+
+Then fill it in:
+
+```dotenv
+# one NAME=API_KEY per line; comments and blank lines are ignored
+work=cmd_live_xxxxxxxxxxxxxxxx
+personal="cmd_live_yyyyyyyyyyyyyyyy"
+export CMDCTL_ACCOUNT_backup=cmd_live_zzzzzzzzzzzz
+```
+
+…and load it:
+
+```bash
+cmdctl accounts import                 # reads accounts.env
+cmdctl accounts import ./team.env      # or any path you like
+```
+
+A few conveniences baked in:
+
+- `export ` prefixes and surrounding quotes are stripped for you.
+- A `CMDCTL_ACCOUNT_` prefix is optional — `CMDCTL_ACCOUNT_work` and `work` are the same account.
+- Re-running `import` updates existing accounts instead of duplicating them.
+- If `accounts.json` is empty and `accounts.env` exists, cmdctl loads it automatically on startup. No command needed.
+
+Point it somewhere else with `CMDCTL_ENV_FILE=/path/to/file`.
+
+---
+
 ## The dashboard
 
-`cmdctl dashboard` is the centerpiece. One command, three acts:
+`cmdctl dashboard` is the centerpiece. One command, four acts:
 
 1. **Accounts table** — status, plan, tokens burned, cost, and credits for every account, plus a running total so you know exactly how fast your money is learning to code.
-2. **Agent usage** — delegated to `ccusage`, so Claude Code, Codex, OpenCode, Amp, Droid, Goose, and a bunch of other coding CLIs get rolled into one local report.
-3. **No data leaves your machine** — ccusage reads local logs, never uploads them. It's nosy, but in a respectful, read-only way.
+2. **Command Code local usage** — turns, tokens, and estimated spend from your on-disk session logs, all-time and month-to-date.
+3. **Agent usage** — delegated to `ccusage`, so Claude Code, Codex, OpenCode, Amp, Droid, Goose, and a bunch of other coding CLIs get rolled into one local report. Narrow it with `--source`.
+4. **No data leaves your machine** — both readers go straight to local files. They're nosy, but in a respectful, read-only way.
 
 ```
 cmdctl dashboard
@@ -125,7 +205,12 @@ ACCOUNT                 STATUS     PLAN       TOKENS      COST          CREDITS
 
 TOTAL ACROSS ACCOUNTS — 492.4M tokens, $69.31
 
-AGENT USAGE (local, across Claude Code / Codex / etc.)
+COMMAND CODE — local session usage
+
+  All time:  913 turns · 229.1M tokens · $33.49
+  This month (2026-09): 612 turns · $3.84
+
+AGENT USAGE — all other harnesses (local)
 ...
 ```
 
@@ -133,13 +218,16 @@ AGENT USAGE (local, across Claude Code / Codex / etc.)
 
 ## Multi-agent support
 
-Yes — cmdctl doesn't just watch Command Code. The `usage` and `dashboard` commands hand off to [ccusage](https://github.com/ryoppippi/ccusage), which reads local usage data from a genuinely absurd list of coding CLIs:
+cmdctl is multi-harness by design, with two engines:
 
-- **Claude Code**, **Codex**, **OpenCode**, **Amp**, **Droid**, **Codebuff**, **Hermes Agent**, **pi-agent**, **Goose**, **OpenClaw**, **Kilo**, **Kimi**, **Qwen**, **GitHub Copilot CLI**, **Gemini CLI**, **Antigravity**, **Grok Build CLI**, and **ZCode**.
+- **Native (Command Code)** — cmdctl parses the per-turn `usage` blocks in `~/.commandcode/projects/**/*.jsonl` itself. No extra dependency, works fully offline.
+- **ccusage** — everything else is read from local logs via [ccusage](https://github.com/ryoppippi/ccusage), which covers a genuinely absurd list of coding CLIs:
 
-That means one `cmdctl dashboard` gives you the "where did all my tokens go" answer across your entire agent menagerie, not just Command Code.
+  **Claude Code**, **Codex**, **OpenCode**, **Amp**, **Droid**, **Codebuff**, **Hermes Agent**, **pi-agent**, **Goose**, **OpenClaw**, **Kilo**, **Kimi**, **Qwen**, **GitHub Copilot CLI**, **Gemini CLI**, **Antigravity**, **Grok Build CLI**, and **ZCode**.
 
-> Note: agent usage reads **local logs** and estimates costs from token counts + model pricing. It's a best-effort sanity check, not an invoice.
+One `cmdctl usage` gives you the "where did all my tokens go" answer across your entire agent menagerie, Command Code included.
+
+> Note: usage is read from **local logs** and costs are estimated from token counts + model pricing. It's a best-effort sanity check, not an invoice.
 
 ---
 
@@ -164,6 +252,7 @@ Everything lives in `~/.config/cmdctl/`:
 | File | Purpose |
 |------|---------|
 | `accounts.json` | Account registry (names + API keys) |
+| `accounts.env` | Optional `NAME=API_KEY` bootstrap file |
 | `state.json` | Current account, exhaustion marks, probe cache |
 
 ### Environment variables
@@ -171,6 +260,10 @@ Everything lives in `~/.config/cmdctl/`:
 | Variable | Default | What it does |
 |----------|---------|-------------|
 | `CMDCTL_DIR` | `~/.config/cmdctl` | Config directory |
+| `CMDCTL_ENV_FILE` | `$CMDCTL_DIR/accounts.env` | Where `accounts import` looks by default |
+| `CMDCTL_DEFAULT_SOURCE` | unset (all) | Default harness for `cmdctl usage` |
+| `CMDCTL_DEFAULT_VIEW` | `daily` | Default view for `cmdctl usage` |
+| `COMMANDCODE_DIR` | `~/.commandcode` | Command Code data dir (session logs live here) |
 | `AUTH_FILE` | `~/.commandcode/auth.json` | Command Code auth file |
 | `REAL_CLI` | auto-detected | Path to command-code entrypoint |
 | `EXHAUSTED_TTL` | `3600` | Seconds before retrying an exhausted account |

@@ -5,6 +5,8 @@ node_modules/
 # Config / state (user-specific, contains API keys)
 state.json
 accounts.json
+accounts.env
+.env
 
 # Command Code artifacts
 *.cmdctl-bak

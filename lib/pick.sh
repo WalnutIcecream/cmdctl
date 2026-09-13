@@ -103,7 +103,7 @@ probe_accounts() {
 
   local pid
   for pid in "${pids[@]}"; do
-    wait "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || true
   done
 
   local i=0
